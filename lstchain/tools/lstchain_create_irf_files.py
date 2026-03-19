@@ -403,7 +403,7 @@ class IRFFITSWriter(Tool):
         if self.mc_particle["gamma"]["mc_type"] in ["point_like", "ring_wobble"]:
             # The 4 is semi-arbitray. This keeps the same precision as the previous code
             mean_fov_offset = np.round(get_mc_fov_offset(self.mc_particle["gamma"]["file"]), 4)
-            fov_offset_bins = [mean_fov_offset - 0.1, mean_fov_offset + 0.1] * u.deg
+            fov_offset_bins = [mean_fov_offset - 1, mean_fov_offset + 1] * u.deg
             self.log.info(f"Single offset for point like gamma MC with offset {mean_fov_offset}")
         else:
             fov_offset_bins = self.data_bin.fov_offset_bins()
