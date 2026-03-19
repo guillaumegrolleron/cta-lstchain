@@ -1099,6 +1099,10 @@ def read_data_dl2_to_QTable(filename, srcdep_pos=None):
     data_params["ZEN_PNT"] = round(zen.to_value(u.deg), 5) * u.deg
     data_params["AZ_PNT"] = round(az.to_value(u.deg), 5) * u.deg
     data_params["B_DELTA"] = round(b_delta.to_value(u.deg), 5) * u.deg
+    
+    mask = data["reco_alt"] > np.pi/2 * u.rad
+    data["reco_alt"] = np.where(mask, np.pi/2*u.rad - data["reco_alt"], data["reco_alt"])
+    data["reco_az"] = np.where(mask, (data["reco_az"] + np.pi * u.rad) % (2*np.pi*u.rad), data["reco_az"])
 
     return data, data_params
 
