@@ -4,8 +4,11 @@ timing parameters. They can be stored in HDF5 file. The option of saving the
 full camera image is also available.
 
 """
+import json
 import logging
 import os
+import time
+from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
 
@@ -49,8 +52,6 @@ from ..io import (
     HDF5_ZSTD_FILTERS,
 )
 from ..io import (
-    add_global_metadata,
-    add_config_metadata,
     global_metadata,
     write_calibration_data,
     write_mcheader,
@@ -59,12 +60,13 @@ from ..io import (
     write_subarray_tables
 )
 
-from ..io.io import add_column_table, dl1_params_lstcam_key, get_resource_path
+from ..io.io import add_column_table, dl1_params_lstcam_key, get_resource_path, serialize_config
 from ..io.lstcontainers import ExtraImageInfo, DL1MonitoringEventIndexContainer
 from ..paths import parse_r0_filename, run_to_dl1_filename, r0_to_dl1_filename
 from ..visualization.plot_reconstructor import plot_debug
 
 logger = logging.getLogger(__name__)
+_bench: dict = defaultdict(float)
 
 __all__ = [
     'add_disp_to_parameters_table',
@@ -139,29 +141,46 @@ def parametrize_image(image, peak_time, signal_pixels, camera_geometry, focal_le
     Calculate image parameters and fill them into ``dl1_container``
     '''
 
+    _t = time.perf_counter()
     geom_selected = camera_geometry[signal_pixels]
     image_selectecd = image[signal_pixels]
+    _bench['param_select'] += time.perf_counter() - _t
+
+    _t = time.perf_counter()
     hillas = hillas_parameters(geom_selected, image_selectecd)
+    _bench['param_hillas'] += time.perf_counter() - _t
 
     # Fill container
     dl1_container.fill_hillas(hillas)
 
-    # convert ctapipe's width and length (in m) to deg:
-
+    # convert ctapipe's width and length (in m) to deg.
+    # Work on plain floats (in meters) and reattach the unit once, to avoid the
+    # per-field astropy Quantity arithmetic overhead (this runs for every event).
+    focal_length_m = focal_length.to_value(u.m)
     for key in ['width', 'width_uncertainty', 'length', 'length_uncertainty']:
-        value = getattr(dl1_container, key)
-        setattr(dl1_container, key, _camera_distance_to_angle(value, focal_length))
+        value_m = getattr(dl1_container, key).to_value(u.m)
+        angle_deg = np.rad2deg(np.arctan(value_m / focal_length_m))
+        setattr(dl1_container, key, u.Quantity(angle_deg, u.deg))
 
     dl1_container.wl = dl1_container.width / dl1_container.length
 
+    _t = time.perf_counter()
     dl1_container.set_timing_features(
         geom_selected,
         image_selectecd,
         peak_time[signal_pixels],
         hillas,
     )
+    _bench['param_timing'] += time.perf_counter() - _t
+
+    _t = time.perf_counter()
     dl1_container.set_leakage(camera_geometry, image, signal_pixels)
+    _bench['param_leakage'] += time.perf_counter() - _t
+
+    _t = time.perf_counter()
     dl1_container.set_concentration(geom_selected, image_selectecd, hillas)
+    _bench['param_concentration'] += time.perf_counter() - _t
+
     dl1_container.log_intensity = np.log10(dl1_container.intensity)
 
 
@@ -192,6 +211,7 @@ def get_dl1(
     DL1ParametersContainer
     """
 
+    _t = time.perf_counter()
     config = replace_config(standard_config, custom_config)
 
     # pop delta_time and use_main_island, so we can pass cleaning_parameters to
@@ -203,6 +223,7 @@ def get_dl1(
     use_dynamic_cleaning = False
     if "apply" in config["dynamic_cleaning"]:
         use_dynamic_cleaning = config["dynamic_cleaning"]["apply"]
+    _bench['dl1_config_setup'] += time.perf_counter() - _t
 
     dl1_container = DL1ParametersContainer() if dl1_container is None else dl1_container
 
@@ -214,12 +235,15 @@ def get_dl1(
     image = dl1.image
     peak_time = dl1.peak_time
 
+    _t = time.perf_counter()
     signal_pixels = cleaning_method(camera_geometry, image, **cleaning_parameters)
+    _bench['dl1_tailcuts'] += time.perf_counter() - _t
     n_pixels = np.count_nonzero(signal_pixels)
 
     if n_pixels > 0:
 
         if delta_time is not None:
+            _t = time.perf_counter()
             signal_pixels = apply_time_delta_cleaning(
                 camera_geometry,
                 signal_pixels,
@@ -227,17 +251,22 @@ def get_dl1(
                 min_number_neighbors=1,
                 time_limit=delta_time
             )
+            _bench['dl1_time_cleaning'] += time.perf_counter() - _t
 
         if use_dynamic_cleaning:
             threshold_dynamic = config['dynamic_cleaning']['threshold']
             fraction_dynamic = config['dynamic_cleaning']['fraction_cleaning_intensity']
+            _t = time.perf_counter()
             signal_pixels = apply_dynamic_cleaning(image,
                                                    signal_pixels,
                                                    threshold_dynamic,
                                                    fraction_dynamic)
+            _bench['dl1_dynamic_cleaning'] += time.perf_counter() - _t
 
         # check the number of islands
+        _t = time.perf_counter()
         num_islands, island_labels = number_of_islands(camera_geometry, signal_pixels)
+        _bench['dl1_islands'] += time.perf_counter() - _t
         dl1_container.n_islands = num_islands
 
         if use_main_island:
@@ -251,6 +280,7 @@ def get_dl1(
         dl1_container.n_pixels = n_pixels
 
         if n_pixels > 0:
+            _t = time.perf_counter()
             parametrize_image(
                 image=image,
                 peak_time=peak_time,
@@ -259,6 +289,7 @@ def get_dl1(
                 focal_length=optics.equivalent_focal_length,
                 dl1_container=dl1_container,
             )
+            _bench['dl1_parametrize'] += time.perf_counter() - _t
 
     # We set other fields which still make sense for a non-parametrized
     # image:
@@ -353,6 +384,23 @@ def r0_to_dl1(
 
     metadata = global_metadata()
     write_metadata(metadata, output_filename)
+
+    # Precompute the metadata payloads once. Both the global metadata dict and
+    # the JSON-serialized config are constant for the whole run, so there is no
+    # need to recompute them (especially the expensive json.dumps of the full
+    # config) for every container and every event.
+    cached_meta_items = metadata.as_dict()
+    cached_config_json = json.dumps(config, default=serialize_config)
+
+    def add_cached_metadata(container):
+        """Attach the precomputed global metadata and config to a container.
+
+        Equivalent to calling ``add_global_metadata(container, metadata)``
+        followed by ``add_config_metadata(container, config)``, but without
+        recomputing the constant payloads on every call.
+        """
+        container.meta.update(cached_meta_items)
+        container.meta["config"] = cached_config_json
 
     # minimum number of pe in a pixel to include it
     # in calculation of muon ring time (peak sample):
@@ -509,6 +557,7 @@ def r0_to_dl1(
 
             if i % 100 == 0:
                 logger.info(i)
+            _bench['n_events'] += 1
 
             event.dl0.prefix = ''
             event.trigger.prefix = ''
@@ -531,8 +580,7 @@ def r0_to_dl1(
                     event.mon = deepcopy(source.r0_r1_calibrator.mon_data)
                     for container in [event.mon.tel[tel_id].pedestal, event.mon.tel[tel_id].flatfield,
                                       event.mon.tel[tel_id].calibration]:
-                        add_global_metadata(container, metadata)
-                        add_config_metadata(container, config)
+                        add_cached_metadata(container)
 
                     # write the first calibration event (initialized from
                     # calibration h5 file, if provided)
@@ -616,14 +664,18 @@ def r0_to_dl1(
             # Option to add nsb in waveforms
             if nsb_tuning:
                 # FIXME? assumes same correction ratio for all telescopes
+                _t = time.perf_counter()
                 for tel_id in allowed_tels:
                     waveform = event.r1.tel[tel_id].waveform
                     selected_gains = event.r1.tel[tel_id].selected_gain_channel
                     mask_high = selected_gains == 0
                     nsb_tuner.tune_nsb_on_waveform(waveform, tel_id, mask_high, subarray)
+                _bench['nsb_tuning'] += time.perf_counter() - _t
 
             # create image for all events
+            _t = time.perf_counter()
             r1_dl1_calibrator(event)
+            _bench['r1_calibration'] += time.perf_counter() - _t
 
             if is_simu:
                 # Scale all integrated charges in all pixels if requested by user:
@@ -632,7 +684,9 @@ def r0_to_dl1(
 
             # Temporal volume reducer for lstchain - dl1 level must be filled and dl0 will be overwritten.
             # When the last version of the method is implemented, vol. reduction will be done at dl0
+            _t = time.perf_counter()
             apply_volume_reduction(event, subarray, config)
+            _bench['volume_reduction'] += time.perf_counter() - _t
 
             # FIXME? This should be eventually done after we evaluate whether the image is
             # a candidate muon ring. In that case the full image could be kept, or reduced
@@ -645,8 +699,6 @@ def r0_to_dl1(
                 # extra info for the image table
                 extra_im.tel_id = telescope_id
                 extra_im.selected_gain_channel = event.r1.tel[telescope_id].selected_gain_channel
-                add_global_metadata(extra_im, metadata)
-                add_config_metadata(extra_im, config)
 
                 focal_length = subarray.tel[telescope_id].optics.equivalent_focal_length
 
@@ -665,6 +717,7 @@ def r0_to_dl1(
                 assert event.dl1.tel[telescope_id].image is not None
 
                 try:
+                    _t = time.perf_counter()
                     get_dl1(
                         event,
                         subarray,
@@ -672,6 +725,7 @@ def r0_to_dl1(
                         dl1_container=dl1_container,
                         custom_config=config,
                     )
+                    _bench['get_dl1_total'] += time.perf_counter() - _t
 
                 except HillasParameterizationError:
                     logging.exception(
@@ -705,10 +759,12 @@ def r0_to_dl1(
 
                 dl1_container.prefix = dl1_tel.prefix
 
+                _t = time.perf_counter()
                 for container in [extra_im, dl1_container, event.r0, dl1_tel]:
-                    add_global_metadata(container, metadata)
-                    add_config_metadata(container, config)
+                    add_cached_metadata(container)
+                _bench['metadata_ops'] += time.perf_counter() - _t
 
+                _t = time.perf_counter()
                 writer.write(table_name=f'telescope/parameters/{tel_name}',
                              containers=[event.index, dl1_container])
 
@@ -716,19 +772,22 @@ def r0_to_dl1(
                     table_name=f'telescope/image/{tel_name}',
                     containers=[event.index, dl1_tel, extra_im]
                 )
+                _bench['writer'] += time.perf_counter() - _t
 
                 if lhfit_fitter is not None:
+                    _t = time.perf_counter()
                     lhfit_container = apply_lh_fit(event, telescope_id, dl1_container, lhfit_fitter)
                     # Plotting code for development purpose only, will disappear in final release
                     if lhfit_fitter.verbose >= 2 and lhfit_container["lhfit_call_status"] == 1:
                         plot_debug(lhfit_fitter, event, telescope_id, dl1_container, str(event.index.event_id))
                     lhfit_container.prefix = dl1_tel.prefix
-                    add_global_metadata(lhfit_container, metadata)
-                    add_config_metadata(lhfit_container, config)
+                    add_cached_metadata(lhfit_container)
                     writer.write(table_name=f'telescope/likelihood_parameters/{tel_name}',
                                  containers=[event.index, lhfit_container])
+                    _bench['lhfit'] += time.perf_counter() - _t
 
                 # Muon ring analysis, for real data only (MC is done starting from DL1 files)
+                _t_muon = time.perf_counter()
                 if not is_simu:
                     bad_pixels = calibration_mon.unusable_pixels[0]
 
@@ -807,6 +866,8 @@ def r0_to_dl1(
                                             muonpars,
                                             hg_peak_sample, lg_peak_sample)
 
+                _bench['muon'] += time.perf_counter() - _t_muon
+
                 # writes mc information per telescope, including photo electron image
                 if (
                         is_simu
@@ -819,6 +880,18 @@ def r0_to_dl1(
                         table_name=f'simulation/{tel_name}',
                         containers=[event.simulation.tel[telescope_id], extra_im]
                     )
+
+        # ---- Timing summary ----
+        n = int(_bench.pop('n_events', 0))
+        total = sum(_bench.values())
+        print(f"\n=== r0_to_dl1 timing summary ({n} events) ===")
+        print(f"  {'step':<30s}  {'total (s)':>10s}  {'per event (ms)':>15s}  {'%':>6s}")
+        for key, val in sorted(_bench.items(), key=lambda x: -x[1]):
+            per_evt = val / n * 1e3 if n > 0 else 0.0
+            pct = 100.0 * val / total if total > 0 else 0.0
+            print(f"  {key:<30s}  {val:>10.3f}  {per_evt:>15.3f}  {pct:>6.1f}%")
+        print(f"  {'TOTAL':<30s}  {total:>10.3f}  {total/n*1e3 if n>0 else 0:>15.3f}")
+        # -------------------------
 
         if event is None:
             logger.warning('No events in file')

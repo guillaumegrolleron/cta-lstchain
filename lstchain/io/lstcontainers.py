@@ -130,6 +130,10 @@ class DL1ParametersContainer(Container):
     # num_trig_pix = Field(None, "Number of trigger groups (sectors) listed")
     # trig_pix_id = Field(None, "Pixels involved in the camera trigger")
 
+    # Cache of the (constant) intersection between a given Hillas container's
+    # keys and this container's keys, so it is not recomputed for every event.
+    _hillas_fill_keys = {}
+
     def fill_hillas(self, hillas):
         """
         fill Hillas parameters
@@ -138,9 +142,14 @@ class DL1ParametersContainer(Container):
         # TODO : parameters should not be simply copied but inherited
         (e.g. conserving unit definition)
         """
-        for key in hillas.keys():
-            if key in self.keys():
-                self[key] = hillas[key]
+        hillas_cls = type(hillas)
+        keys = DL1ParametersContainer._hillas_fill_keys.get(hillas_cls)
+        if keys is None:
+            own_keys = set(self.keys())
+            keys = [key for key in hillas.keys() if key in own_keys]
+            DL1ParametersContainer._hillas_fill_keys[hillas_cls] = keys
+        for key in keys:
+            self[key] = hillas[key]
 
     def fill_mc(self, event, tel_pos):
         """
